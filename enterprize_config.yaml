@@ -1,0 +1,29 @@
+enterprise:
+  name: "YOUR COMPANY NAME"
+  logo_url: ""
+  primary_color: "#1e40af"
+  secondary_color: "#7c3aed"
+
+elk:
+  host: "http://localhost:9200"
+  kibana_host: "http://localhost:5601"
+  username: "elastic"
+  password: "your_password"
+  verify_certs: false
+
+email:
+  smtp_server: "smtp.gmail.com"
+  smtp_port: 587
+  sender_email: "taskeenafifa934@gmail.com"
+  username: ""
+  password: ""
+
+notifications:
+  email_alerts: true
+  slack_webhook: ""
+  teams_webhook: ""
+
+security:
+  session_timeout: 30
+  password_expiry: 90
+  mfa_required: false
