@@ -1,5 +1,27 @@
 version: '3.8'
+
 services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15
+    container_name: postgres-threat
+    environment:
+      POSTGRES_DB: threat_detection
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d  # Optional: for init scripts
+    networks:
+      - elk-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
     container_name: elasticsearch
@@ -14,6 +36,9 @@ services:
       - elasticsearch-data:/usr/share/elasticsearch/data
     networks:
       - elk-network
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   logstash:
     image: docker.elastic.co/logstash/logstash:8.11.0
@@ -27,6 +52,7 @@ services:
       - LS_JAVA_OPTS=-Xms256m -Xmx256m
     depends_on:
       - elasticsearch
+      - postgres
     networks:
       - elk-network
 
@@ -42,10 +68,25 @@ services:
     networks:
       - elk-network
 
+  # Optional: Adminer for database management (web interface)
+  adminer:
+    image: adminer
+    container_name: adminer
+    ports:
+      - "8080:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    depends_on:
+      - postgres
+    networks:
+      - elk-network
+
 networks:
   elk-network:
     driver: bridge
 
 volumes:
   elasticsearch-data:
+    driver: local
+  postgres-data:
     driver: local

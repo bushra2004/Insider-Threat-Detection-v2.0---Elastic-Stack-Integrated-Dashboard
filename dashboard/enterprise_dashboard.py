@@ -1,4 +1,4 @@
-# dashboard/enterprise_dashboard.py - COMPATIBLE VERSION
+# dashboard/enterprise_dashboard.py - COMPLETE VERSION WITH POSTGRESQL
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 import io
 import base64
 import warnings
+import sys
 
 warnings.filterwarnings('ignore')
 
@@ -34,6 +35,110 @@ ENTERPRISE_CONFIG = {
     "elk_host": "http://localhost:9200",
     "kibana_url": "http://localhost:5601",
 }
+
+# ============================================
+# DATABASE CONFIGURATION (PostgreSQL)
+# ============================================
+
+DB_CONFIG = {
+    "enabled": True,
+    "connection_string": "postgresql://postgres:password@localhost:5432/threat_detection"
+}
+
+def init_database():
+    """Initialize database connection"""
+    if not DB_CONFIG["enabled"]:
+        return None
+    
+    try:
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        
+        engine = create_engine(DB_CONFIG["connection_string"])
+        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+        return SessionLocal()
+    except Exception as e:
+        return None
+
+def save_threats_to_db(threats_df):
+    """Save threats to PostgreSQL database"""
+    if not DB_CONFIG["enabled"]:
+        return False
+    
+    try:
+        session = init_database()
+        if not session:
+            return False
+        
+        from sqlalchemy import text
+        
+        success_count = 0
+        error_count = 0
+        
+        for _, threat in threats_df.iterrows():
+            try:
+                username = threat['user'].split('@')[0] if '@' in threat['user'] else threat['user']
+                
+                user_query = text("""
+                    INSERT INTO users (username, email, department, role, risk_score, status)
+                    VALUES (:username, :email, :department, 'employee', :risk_score, 'active')
+                    ON CONFLICT (username) DO UPDATE SET
+                        department = EXCLUDED.department,
+                        risk_score = EXCLUDED.risk_score,
+                        last_risk_assessment = NOW()
+                    RETURNING user_id
+                """)
+                
+                user_result = session.execute(user_query, {
+                    'username': username,
+                    'email': threat['user'],
+                    'department': threat['department'],
+                    'risk_score': float(threat['risk_score'])
+                }).fetchone()
+                
+                user_id = user_result[0] if user_result else None
+                
+                threat_query = text("""
+                    INSERT INTO threats (
+                        user_id, timestamp, threat_type, severity, description,
+                        source_ip, department, confidence_score, investigation_status
+                    ) VALUES (
+                        :user_id, :timestamp, :threat_type, :severity, :description,
+                        :source_ip, :department, :confidence_score, 'new'
+                    )
+                    RETURNING threat_id
+                """)
+                
+                severity = threat['severity'].lower() if isinstance(threat['severity'], str) else 'medium'
+                
+                session.execute(threat_query, {
+                    'user_id': user_id,
+                    'timestamp': pd.to_datetime(threat['timestamp']),
+                    'threat_type': str(threat['action']),
+                    'severity': severity,
+                    'description': f"{threat['action']} by {threat['user']} in {threat['department']}",
+                    'source_ip': str(threat['source_ip']),
+                    'department': str(threat['department']),
+                    'confidence_score': float(threat['risk_score']) / 100.0 * 90.0
+                })
+                
+                success_count += 1
+                
+            except Exception as e:
+                error_count += 1
+                continue
+        
+        session.commit()
+        session.close()
+        
+        if success_count > 0:
+            st.session_state.last_save_count = success_count
+            return True
+        else:
+            return False
+        
+    except Exception as e:
+        return False
 
 # ============================================
 # PAGE CONFIGURATION
@@ -163,9 +268,8 @@ class InsiderThreatDashboard:
     """Main dashboard class"""
     
     def __init__(self):
-        # Initialize session state
         if 'authenticated' not in st.session_state:
-            st.session_state.authenticated = True  # Auto-login for demo
+            st.session_state.authenticated = True
         if 'current_user' not in st.session_state:
             st.session_state.current_user = {
                 "username": "soc_analyst",
@@ -176,6 +280,76 @@ class InsiderThreatDashboard:
             st.session_state.threat_data = generate_sample_threats(150)
         if 'sysmon_data' not in st.session_state:
             st.session_state.sysmon_data = generate_sysmon_sample(75)
+    
+    def get_database_analytics(self, session):
+        """Get professional analytics from database"""
+        from sqlalchemy import text
+        
+        analytics = {}
+        
+        try:
+            risky_users_query = text("""
+                SELECT 
+                    username,
+                    department,
+                    risk_score,
+                    (SELECT COUNT(*) FROM threats 
+                     WHERE threats.user_id = users.user_id 
+                     AND threats.timestamp >= NOW() - INTERVAL '7 days') as recent_threats
+                FROM users 
+                WHERE status = 'active'
+                ORDER BY risk_score DESC 
+                LIMIT 10
+            """)
+            
+            risky_users = pd.read_sql(risky_users_query, session.bind)
+            analytics['risky_users'] = risky_users
+            
+            dept_risk_query = text("""
+                SELECT 
+                    department,
+                    COUNT(*) as user_count,
+                    AVG(risk_score) as avg_risk_score
+                FROM users
+                WHERE status = 'active'
+                GROUP BY department
+                ORDER BY avg_risk_score DESC
+            """)
+            
+            dept_risk = pd.read_sql(dept_risk_query, session.bind)
+            analytics['department_risk'] = dept_risk
+            
+            timeline_query = text("""
+                SELECT 
+                    DATE(timestamp) as threat_date,
+                    severity,
+                    COUNT(*) as threat_count
+                FROM threats
+                WHERE timestamp >= NOW() - INTERVAL '7 days'
+                GROUP BY DATE(timestamp), severity
+                ORDER BY threat_date DESC, severity
+            """)
+            
+            timeline = pd.read_sql(timeline_query, session.bind)
+            analytics['timeline'] = timeline
+            
+            stats_query = text("""
+                SELECT 
+                    COUNT(*) as total_threats,
+                    SUM(CASE WHEN severity = 'critical' THEN 1 ELSE 0 END) as critical_threats,
+                    SUM(CASE WHEN severity = 'high' THEN 1 ELSE 0 END) as high_threats,
+                    SUM(CASE WHEN investigation_status = 'new' THEN 1 ELSE 0 END) as new_threats
+                FROM threats
+                WHERE timestamp >= NOW() - INTERVAL '24 hours'
+            """)
+            
+            stats = pd.read_sql(stats_query, session.bind)
+            analytics['stats'] = stats.iloc[0] if not stats.empty else {}
+            
+        except Exception as e:
+            print(f"Analytics query error: {e}")
+        
+        return analytics
     
     def create_header(self):
         """Create dashboard header"""
@@ -229,7 +403,6 @@ class InsiderThreatDashboard:
             
             st.markdown("---")
             
-            # System Status
             st.markdown("### 🔌 SYSTEM STATUS")
             col1, col2 = st.columns(2)
             with col1:
@@ -239,12 +412,42 @@ class InsiderThreatDashboard:
                     st.session_state.threat_data['severity'] == 'Critical'
                 ])
                 st.metric("Critical", critical, delta_color="inverse")
+            
+            if DB_CONFIG["enabled"]:
+                st.markdown("### 🗄️ DATABASE STATUS")
+                try:
+                    session = init_database()
+                    if session:
+                        from sqlalchemy import text
+                        
+                        user_count = pd.read_sql(
+                            text("SELECT COUNT(*) FROM users WHERE status = 'active'"), 
+                            session.bind
+                        ).iloc[0, 0]
+                        
+                        threat_count = pd.read_sql(
+                            text("SELECT COUNT(*) FROM threats"), 
+                            session.bind
+                        ).iloc[0, 0]
+                        
+                        recent_threats = pd.read_sql(
+                            text("SELECT COUNT(*) FROM threats WHERE timestamp >= NOW() - INTERVAL '24 hours'"), 
+                            session.bind
+                        ).iloc[0, 0]
+                        
+                        session.close()
+                        
+                        st.metric("Active Users", user_count)
+                        st.metric("Total Threats", threat_count)
+                        st.metric("24h Threats", recent_threats)
+                        
+                except Exception as e:
+                    st.caption(f"Database: {str(e)[:50]}")
     
     def create_dashboard_tab(self):
         """Create main dashboard"""
         st.header("📊 REAL-TIME THREAT DASHBOARD")
         
-        # Metrics Row
         col1, col2, col3, col4, col5 = st.columns(5)
         
         df = st.session_state.threat_data
@@ -298,13 +501,11 @@ class InsiderThreatDashboard:
             </div>
             """, unsafe_allow_html=True)
         
-        # Charts
         col1, col2 = st.columns(2)
         
         with col1:
             st.subheader("📊 Threat Distribution")
             
-            # Severity distribution
             severity_counts = df['severity'].value_counts().reset_index()
             severity_counts.columns = ['Severity', 'Count']
             
@@ -322,7 +523,6 @@ class InsiderThreatDashboard:
         with col2:
             st.subheader("📈 Risk Timeline")
             
-            # Group by hour
             df['hour'] = pd.to_datetime(df['timestamp']).dt.hour
             timeline = df.groupby('hour').agg({
                 'risk_score': 'mean',
@@ -335,7 +535,6 @@ class InsiderThreatDashboard:
             fig.update_traces(line=dict(color='#00ff41', width=3))
             st.plotly_chart(fig, use_container_width=True)
         
-        # Recent Threats Table
         st.subheader("🚨 RECENT THREATS")
         
         recent_threats = df.sort_values('timestamp', ascending=False).head(10)
@@ -358,6 +557,37 @@ class InsiderThreatDashboard:
                 Department: {threat['department']} | Status: {threat['status']}
             </div>
             """, unsafe_allow_html=True)
+        
+        if DB_CONFIG["enabled"]:
+            try:
+                session = init_database()
+                if session:
+                    analytics = self.get_database_analytics(session)
+                    session.close()
+                    
+                    if analytics:
+                        st.markdown("---")
+                        st.subheader("🗄️ DATABASE ANALYTICS")
+                        
+                        col1, col2 = st.columns(2)
+                        
+                        with col1:
+                            if 'stats' in analytics and not analytics['stats'].empty:
+                                stats = analytics['stats']
+                                st.metric("24h Threats", int(stats.get('total_threats', 0)))
+                                st.metric("Critical Threats", int(stats.get('critical_threats', 0)))
+                                st.metric("New Threats", int(stats.get('new_threats', 0)))
+                        
+                        with col2:
+                            if 'risky_users' in analytics and not analytics['risky_users'].empty:
+                                st.write("**Top Risky Users**")
+                                st.dataframe(
+                                    analytics['risky_users'].head(5),
+                                    hide_index=True,
+                                    use_container_width=True
+                                )
+            except:
+                pass
     
     def create_threat_analysis_tab(self):
         """Create threat analysis tab"""
@@ -365,7 +595,6 @@ class InsiderThreatDashboard:
         
         df = st.session_state.threat_data
         
-        # Filters
         col1, col2, col3 = st.columns(3)
         
         with col1:
@@ -389,7 +618,6 @@ class InsiderThreatDashboard:
                 (60, 100)
             )
         
-        # Apply filters
         filtered_df = df[
             (df['severity'].isin(severity_filter)) &
             (df['department'].isin(department_filter)) &
@@ -399,7 +627,6 @@ class InsiderThreatDashboard:
         
         st.metric("Filtered Threats", len(filtered_df))
         
-        # Detailed table
         st.dataframe(
             filtered_df[[
                 'timestamp', 'user', 'action', 'severity', 
@@ -408,7 +635,6 @@ class InsiderThreatDashboard:
             use_container_width=True
         )
         
-        # Department Analysis
         st.subheader("🏢 DEPARTMENT ANALYSIS")
         
         dept_analysis = filtered_df.groupby('department').agg({
@@ -436,22 +662,18 @@ class InsiderThreatDashboard:
         """Create Sysmon analysis tab"""
         st.header("📡 SYSMON LOG ANALYSIS")
         
-        # File upload
         uploaded_file = st.file_uploader("Upload Sysmon CSV", type=['csv'])
         
         if uploaded_file is not None:
-            # Load uploaded data
             sysmon_df = pd.read_csv(uploaded_file)
             st.success(f"✅ Loaded {len(sysmon_df)} Sysmon events")
             st.session_state.uploaded_sysmon = sysmon_df
         elif hasattr(st.session_state, 'uploaded_sysmon'):
             sysmon_df = st.session_state.uploaded_sysmon
         else:
-            # Use sample data
             sysmon_df = st.session_state.sysmon_data
             st.info("Using sample Sysmon data. Upload a CSV file for real analysis.")
         
-        # Statistics
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
@@ -467,7 +689,6 @@ class InsiderThreatDashboard:
             high_risk = len(sysmon_df[sysmon_df['severity'].isin(['High', 'Critical'])])
             st.metric("High Risk", high_risk)
         
-        # Event Type Analysis
         st.subheader("📊 EVENT TYPE DISTRIBUTION")
         
         event_counts = sysmon_df['event_type'].value_counts().reset_index()
@@ -477,7 +698,6 @@ class InsiderThreatDashboard:
                     title="Sysmon Event Types", hole=0.3)
         st.plotly_chart(fig, use_container_width=True)
         
-        # Top Processes
         st.subheader("🔝 TOP PROCESSES")
         
         top_processes = sysmon_df['process_name'].value_counts().head(10).reset_index()
@@ -488,7 +708,6 @@ class InsiderThreatDashboard:
                     color_continuous_scale='reds')
         st.plotly_chart(fig, use_container_width=True)
         
-        # Raw Data
         with st.expander("📋 VIEW RAW DATA"):
             st.dataframe(sysmon_df, use_container_width=True)
     
@@ -498,10 +717,8 @@ class InsiderThreatDashboard:
         
         df = st.session_state.threat_data
         
-        # Time Series Analysis
         st.subheader("⏰ TIME SERIES ANALYSIS")
         
-        # Convert timestamp and group by day
         df['date'] = pd.to_datetime(df['timestamp']).dt.date
         daily_counts = df.groupby('date').size().reset_index()
         daily_counts.columns = ['Date', 'Threat Count']
@@ -511,7 +728,6 @@ class InsiderThreatDashboard:
                      markers=True)
         st.plotly_chart(fig, use_container_width=True)
         
-        # User Risk Analysis
         st.subheader("👤 USER RISK PROFILING")
         
         user_risk = df.groupby('user').agg({
@@ -519,7 +735,6 @@ class InsiderThreatDashboard:
             'id': 'count'
         }).rename(columns={'id': 'threat_count'}).reset_index()
         
-        # Top 10 risky users
         top_risky_users = user_risk.sort_values('risk_score', ascending=False).head(10)
         
         fig = px.bar(top_risky_users, x='user', y='risk_score',
@@ -528,15 +743,10 @@ class InsiderThreatDashboard:
                     color_continuous_scale='reds')
         st.plotly_chart(fig, use_container_width=True)
         
-        # Correlation Analysis
-        st.subheader("🔗 CORRELATION ANALYSIS")
-        
-        # Create correlation matrix
         numeric_df = df[['risk_score']].copy()
         if 'port' in df.columns:
             numeric_df['port'] = df['port']
         
-        # Add department as numeric (for demo)
         dept_mapping = {dept: i for i, dept in enumerate(ENTERPRISE_CONFIG["departments"])}
         numeric_df['dept_numeric'] = df['department'].map(dept_mapping)
         
@@ -548,12 +758,48 @@ class InsiderThreatDashboard:
                            color_continuous_scale='RdBu',
                            text_auto=True)
             st.plotly_chart(fig, use_container_width=True)
+        
+        if DB_CONFIG["enabled"]:
+            st.markdown("---")
+            st.subheader("🗄️ DATABASE ANALYTICS")
+            
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("📊 Load from Database", use_container_width=True):
+                    try:
+                        session = init_database()
+                        if session:
+                            from sqlalchemy import text
+                            query = text("SELECT * FROM threats ORDER BY timestamp DESC")
+                            db_data = pd.read_sql(query, session.bind)
+                            session.close()
+                            
+                            if not db_data.empty:
+                                st.session_state.db_threats = db_data
+                                st.success(f"✅ Loaded {len(db_data)} threats from database")
+                                st.dataframe(db_data.head(10), use_container_width=True)
+                            else:
+                                st.info("No threats found in database")
+                    except Exception as e:
+                        st.error(f"❌ Error: {str(e)[:100]}")
+            
+            with col2:
+                if st.button("🧹 Clear Database", use_container_width=True, type="secondary"):
+                    try:
+                        session = init_database()
+                        if session:
+                            session.execute(text("DELETE FROM threats"))
+                            session.commit()
+                            session.close()
+                            st.success("✅ Database cleared!")
+                    except:
+                        st.error("Failed to clear database")
     
     def create_configuration_tab(self):
         """Create configuration tab"""
         st.header("⚙️ CONFIGURATION")
         
-        # Alert Settings
         st.subheader("🚨 ALERT SETTINGS")
         
         col1, col2 = st.columns(2)
@@ -576,7 +822,6 @@ class InsiderThreatDashboard:
             
             slack_alerts = st.checkbox("Slack Integration", value=False)
         
-        # Departments to Monitor
         st.subheader("🏢 MONITORED DEPARTMENTS")
         
         departments = ENTERPRISE_CONFIG["departments"]
@@ -586,15 +831,62 @@ class InsiderThreatDashboard:
             default=departments
         )
         
-        # ELK Configuration
         st.subheader("🔗 ELK STACK CONFIGURATION")
         
         elk_host = st.text_input("Elasticsearch Host", value="http://localhost:9200")
         kibana_url = st.text_input("Kibana URL", value="http://localhost:5601")
         
+        st.markdown("---")
+        st.subheader("🗄️ DATABASE CONFIGURATION (PostgreSQL)")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            db_enabled = st.toggle(
+                "Enable PostgreSQL Storage",
+                value=DB_CONFIG["enabled"],
+                help="Store threats in PostgreSQL database"
+            )
+            
+            if db_enabled:
+                st.success("✅ PostgreSQL will store threat data")
+            else:
+                st.info("ℹ️ Using in-memory data only")
+        
+        with col2:
+            if db_enabled:
+                connection_string = st.text_input(
+                    "Database Connection String",
+                    value=DB_CONFIG["connection_string"],
+                    help="Format: postgresql://username:password@host:port/database"
+                )
+                
+                if st.button("🔗 Test Database Connection"):
+                    try:
+                        import psycopg2
+                        conn = psycopg2.connect(connection_string)
+                        conn.close()
+                        st.success("✅ Database connection successful!")
+                    except Exception as e:
+                        st.error(f"❌ Connection failed: {str(e)[:100]}")
+        
+        if 'threat_data' in st.session_state and db_enabled:
+            st.markdown("---")
+            if st.button("💾 Save Current Threats to Database", use_container_width=True):
+                with st.spinner("Saving to database..."):
+                    success = save_threats_to_db(st.session_state.threat_data)
+                    if success:
+                        st.success(f"✅ Saved {len(st.session_state.threat_data)} threats to database!")
+                    else:
+                        st.error("❌ Failed to save to database. Check connection.")
+        
         col1, col2 = st.columns(2)
         with col1:
             if st.button("💾 Save Configuration", use_container_width=True):
+                current_module = sys.modules[__name__]
+                current_module.DB_CONFIG["enabled"] = db_enabled
+                if db_enabled:
+                    current_module.DB_CONFIG["connection_string"] = connection_string
                 st.success("Configuration saved!")
         
         with col2:
@@ -603,16 +895,13 @@ class InsiderThreatDashboard:
     
     def run(self):
         """Main dashboard runner"""
-        # Auto-login for demo
         if not st.session_state.authenticated:
             st.session_state.authenticated = True
             st.rerun()
         
-        # Create interface
         self.create_header()
         self.create_sidebar()
         
-        # Show selected tab
         tab = st.session_state.get('current_tab', '📊 Dashboard')
         
         if tab == "📊 Dashboard":
@@ -632,11 +921,7 @@ class InsiderThreatDashboard:
 
 def main():
     """Main application entry point"""
-    
-    # Initialize dashboard
     dashboard = InsiderThreatDashboard()
-    
-    # Run the dashboard
     dashboard.run()
 
 if __name__ == "__main__":
